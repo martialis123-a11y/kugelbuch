@@ -1,6 +1,6 @@
 // Service Worker: hält die App offline verfügbar.
 // Bei jeder neuen Version VERSION erhöhen, dann bietet die App „Neu laden“ an.
-const VERSION = 'kugelbuch-1.0.0';
+const VERSION = 'kugelbuch-1.1.0';
 const FILES = [
   './',
   './index.html',

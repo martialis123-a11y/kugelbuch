@@ -466,3 +466,48 @@ details.table-view summary { color: var(--accent); cursor: pointer; font-weight:
 .btn[disabled] { opacity: .5; }
 
 .switch input[type=range] { accent-color: var(--accent); }
+
+/* ---------- Meine Trainings (Vorlagen) ---------- */
+.tpl-empty {
+  display: grid; gap: 10px; padding: 16px 18px;
+  border: 1.5px dashed var(--line); border-radius: var(--r-l);
+}
+.tpl-item { align-items: center; }
+.tpl-item .s + .s { margin-top: 0; }
+.play {
+  width: 44px; height: 44px; border-radius: 50%; flex: none;
+  display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-ink);
+}
+.play svg, .btn svg path[d^="M8 5.5"] { fill: currentColor; stroke: none; }
+.play svg { width: 20px; height: 20px; margin-left: 2px; }
+.tpl-tools { flex-wrap: wrap; gap: 4px; margin-top: 14px; }
+.tpl-head { margin-bottom: 14px; }
+.tpl-body { padding: 4px 16px 14px; }
+.tpl-body > .seg { margin-bottom: 12px; }
+.tpl-timer { margin-top: 4px; }
+.tpl-timer .grow-full { flex-basis: 100%; min-width: 0; }
+.tpl-sets { margin: 0 -16px; width: calc(100% + 32px); }
+.tpl-sets tbody tr { cursor: pointer; }
+.tpl-sets tbody tr:active td { background: var(--surface-2); }
+.tpl-sets .icon-btn { width: 32px; height: 32px; }
+
+/* Geplante Sätze in der laufenden Einheit */
+.sets tr.planned td { color: var(--muted); border-top-style: dashed; cursor: pointer; }
+.sets tr.planned .w-cell { opacity: .75; }
+.sets tr.planned:active td { background: var(--surface-2); }
+.check-btn {
+  width: 36px; height: 36px; border-radius: 50%;
+  border: 2px solid var(--accent); background: transparent; color: var(--accent);
+  display: inline-grid; place-items: center; padding: 0;
+}
+.check-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+.check-btn:active { background: var(--accent); color: var(--accent-ink); }
+.plan-timer {
+  display: flex; align-items: center; gap: 12px;
+  margin: 2px 12px 10px; padding: 10px 12px;
+  background: var(--accent-soft); border-radius: var(--r-s);
+}
+.plan-timer .t { font-weight: 600; font-size: .95rem; }
+.plan-timer.done { background: var(--surface-2); }
+.plan-timer.done .t { color: var(--muted); }
