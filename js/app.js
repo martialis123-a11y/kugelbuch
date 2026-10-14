@@ -8,11 +8,13 @@ import {
   exById, exName, saveExercise, deleteExercise, exerciseUsage, sessionById, saveSession, deleteSession,
   setVolume, setReps, sessionDuration, sessionVolume, finishedSessions, lastPerformance,
   exportData, importData, wipeAll, STARTER_EXERCISES,
+  templateById, saveTemplate, deleteTemplate, moveTemplate, exerciseTemplates,
+  entryToItem, sessionToItems, itemToEntry, itemsSignature,
 } from './store.js';
 import { startTimer, startRest, stopRest, signal, initAudio, wakeOn, wakeOff } from './timer.js';
 import { heatmap, bars, timeline } from './charts.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const view = $('#view');
 const ui = {
   tab: 'training',
@@ -24,6 +26,7 @@ const ui = {
   statMetric: null,
   historyFilter: '',
   sessionWake: false,
+  tplEdit: null,          // ID der Vorlage, die gerade bearbeitet wird
 };
 
 // ---------- Symbole ----------
@@ -35,6 +38,7 @@ const ICON = {
   check: '<svg viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
   timer: '<svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z"/></svg>',
 };
 
 // ---------- Kleine UI-Bausteine ----------
@@ -196,6 +200,7 @@ function entrySummary(ex, entry) {
 function setTab(tab) {
   const ed = ui.editing && sessionById(ui.editing);
   if (ed && !ed.entries.length) deleteSession(ed.id);
+  closeTemplateEditor();
   ui.tab = tab;
   ui.editing = null;
   render();
@@ -211,6 +216,8 @@ function render() {
   $('.tabs [data-tab="training"]').classList.toggle('has-live', !!state.activeId);
   const extra = $('#appbar-extra');
   extra.innerHTML = '';
+  if (ui.tplEdit && templateById(ui.tplEdit)) return renderTemplateEditor(templateById(ui.tplEdit));
+  ui.tplEdit = null;
   if (ui.editing && sessionById(ui.editing)) return renderEditor(sessionById(ui.editing), 'edit');
   ui.editing = null;
   ({ training: renderTraining, verlauf: renderHistory, auswertung: renderStats, uebungen: renderExercises, daten: renderData })[ui.tab]();
@@ -267,29 +274,173 @@ function renderTraining() {
             <button class="btn btn-ghost" data-act="starter">Beispielübungen übernehmen</button>
           </div>
         </div>` : ''}
+      ${state.exercises.length ? templateSection(last) : ''}
       <section class="start">
         <div class="row-between">
           <h2>Diese Woche</h2>
           <span class="muted small">${weekCount === 0 ? 'noch kein Training' : weekCount === 1 ? '1 Einheit' : `${weekCount} Einheiten`}</span>
         </div>
         <div class="start-week">${days}</div>
-        <button class="btn btn-primary btn-xl btn-block" data-act="start">Training starten</button>
+        <button class="btn ${state.templates.length ? 'btn-ghost' : 'btn-primary'} btn-xl btn-block" data-act="start">${state.templates.length ? 'Freies Training starten' : 'Training starten'}</button>
         <button class="btn btn-text" data-act="backfill">Vergangenes Training nachtragen</button>
       </section>
       ${last ? `
         <section>
           <div class="section-title"><h2>Letztes Training</h2><span class="muted small">${relDays(last.start)}</span></div>
           <div class="list">${historyItem(last)}</div>
-          <button class="btn btn-ghost btn-block" style="margin-top:12px" data-act="repeat" data-id="${last.id}">Mit diesen Übungen starten</button>
+          <div class="row" style="margin-top:12px">
+            <button class="btn btn-ghost grow" data-act="repeat" data-id="${last.id}">Wiederholen</button>
+            <button class="btn btn-ghost grow" data-act="save-as-tpl" data-id="${last.id}">Als Vorlage speichern</button>
+          </div>
         </section>` : ''}
     </div>`;
 }
 
-async function startTraining(template) {
+// ---------- Meine Trainings (Vorlagen) ----------
+function templateMeta(t) {
+  const exCount = t.items.filter((it) => exById(it.exId)).length;
+  const bits = [`${exCount} ${exCount === 1 ? 'Übung' : 'Übungen'}`];
+  if (t.lastUsed) bits.push(`zuletzt ${relDays(t.lastUsed)}`);
+  return bits.join(', ');
+}
+function templateSection(last) {
+  if (!state.templates.length) {
+    return `<section class="tpl-empty">
+      <h2>Meine Trainings</h2>
+      <p class="small muted">Speichere Trainings, die du öfter machst. Dann startest du sie mit einem Tipp, die Sätze sind schon vorausgefüllt.</p>
+      <div class="row" style="flex-wrap:wrap">
+        <button class="btn btn-s btn-primary" data-act="tpl-new">${ICON.plus} Training zusammenstellen</button>
+        ${last ? `<button class="btn btn-s btn-ghost" data-act="save-as-tpl" data-id="${last.id}">Letztes Training speichern</button>` : ''}
+      </div>
+    </section>`;
+  }
+  return `<section>
+    <div class="section-title" style="margin-top:0"><h2>Meine Trainings</h2>
+      <button class="btn btn-text btn-s" data-act="tpl-new">${ICON.plus} Neu</button></div>
+    <div class="list">${state.templates.map((t) => `
+      <button class="list-item tpl-item" data-act="tpl-open" data-id="${t.id}">
+        <div class="grow">
+          <div class="t">${esc(t.name || 'Ohne Namen')}</div>
+          <div class="s">${esc(t.items.map((it) => exName(exById(it.exId))).filter((x) => x !== 'Gelöschte Übung').join(', ') || 'noch keine Übungen')}</div>
+          <div class="s">${templateMeta(t)}</div>
+        </div>
+        <span class="play" aria-hidden="true">${ICON.play}</span>
+      </button>`).join('')}
+    </div>
+  </section>`;
+}
+
+function itemSummary(ex, item) {
+  const parts = [];
+  if (item.timer?.mode === 'emom') {
+    const tm = item.timer;
+    let txt = `EMOM ${tm.rounds} × ${clock(tm.interval)}`;
+    if (tm.r) txt += `, ${num(tm.r)} Wdh${ex?.side === 'one' ? ' je Seite' : ''}`;
+    if (tm.t) txt += `, ${setTime(tm.t)}`;
+    if (tm.w) txt += ` mit ${weightText(ex, tm.w)}`;
+    parts.push(txt);
+  } else if (item.timer?.mode === 'countdown') {
+    parts.push(`AMRAP ${setTime(item.timer.total)}${item.timer.w ? ` mit ${weightText(ex, item.timer.w)}` : ''}`);
+  }
+  if (item.sets?.length) parts.push(entrySummary(ex, { sets: item.sets }));
+  return parts.join(' + ') || 'noch keine Sätze';
+}
+
+function openTemplateSheet(t) {
+  const items = t.items.filter((it) => exById(it.exId));
+  const i = state.templates.indexOf(t);
+  const busy = !!state.activeId;
+  openSheet({
+    title: t.name || 'Ohne Namen',
+    body: `
+      ${items.length ? `<div class="list">${items.map((it) => {
+        const ex = exById(it.exId);
+        return `<div class="list-item"><div class="grow"><div class="t">${esc(exName(ex))}</div><div class="s">${esc(itemSummary(ex, it))}</div></div></div>`;
+      }).join('')}</div>` : '<p class="muted">Diese Vorlage enthält noch keine Übungen.</p>'}
+      ${busy ? '<p class="small muted" style="margin-top:12px">Es läuft gerade ein Training. Beende es zuerst, um diese Vorlage zu starten.</p>' : ''}
+      <div class="row tpl-tools">
+        ${i > 0 ? '<button class="btn btn-text btn-s" data-m="up">Nach oben</button>' : ''}
+        ${i < state.templates.length - 1 ? '<button class="btn btn-text btn-s" data-m="down">Nach unten</button>' : ''}
+        <button class="btn btn-text btn-s" data-m="dup">Duplizieren</button>
+        <button class="btn btn-text btn-s" data-m="del" style="color:var(--danger)">Löschen</button>
+      </div>`,
+    foot: `<button class="btn btn-ghost" data-m="edit">Bearbeiten</button>
+      <button class="btn btn-primary" data-m="start" ${busy || !items.length ? 'disabled' : ''}>${ICON.play} Starten</button>`,
+    onMount: (sh, close) => sh.addEventListener('click', async (e) => {
+      const m = e.target.closest('[data-m]')?.dataset.m;
+      if (!m) return;
+      if (m === 'start') { close(); return startTraining({ template: t }); }
+      if (m === 'edit') { close(); return openTemplateEditor(t); }
+      if (m === 'up' || m === 'down') { await moveTemplate(t.id, m === 'up' ? -1 : 1); close(); return render(); }
+      if (m === 'dup') {
+        const copy = structuredClone(t);
+        delete copy.id; delete copy.order; delete copy.lastUsed;
+        copy.created = Date.now();
+        copy.name = `${t.name} (Kopie)`;
+        copy.items = copy.items.map((it) => ({ ...it, id: uid() }));
+        await saveTemplate(copy);
+        close(); render();
+        return toast('Vorlage dupliziert');
+      }
+      if (m === 'del') {
+        close();
+        if (!(await confirmSheet({ title: 'Vorlage löschen?', text: `„${esc(t.name)}“ wird gelöscht. Deine bisherigen Trainings bleiben im Verlauf erhalten.`, ok: 'Löschen', danger: true }))) return;
+        await deleteTemplate(t.id);
+        render();
+        toast('Vorlage gelöscht', { label: 'Rückgängig', run: async () => { await saveTemplate(t); render(); } });
+      }
+    }),
+  });
+}
+
+function promptName({ title, value = '', ok = 'Speichern', hint = '' }) {
+  return new Promise((resolve) => {
+    let result = null;
+    openSheet({
+      title,
+      body: `<label class="field"><span>Name</span><input type="text" data-name value="${esc(value)}" placeholder="z. B. Swing-Tag oder Ganzkörper A" autocomplete="off" data-autofocus></label>
+        ${hint ? `<p class="small muted" style="margin-top:10px">${hint}</p>` : ''}`,
+      foot: `<button class="btn btn-ghost" data-close>Abbrechen</button><button class="btn btn-primary" data-ok>${esc(ok)}</button>`,
+      onMount: (sh, close) => {
+        const inp = sh.querySelector('[data-name]');
+        const go = () => { result = inp.value.trim() || value || 'Neues Training'; close(); };
+        sh.querySelector('[data-ok]').onclick = go;
+        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+      },
+      onClose: () => resolve(result),
+    });
+  });
+}
+
+function suggestName() {
+  const used = new Set(state.templates.map((t) => t.name));
+  for (const l of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') if (!used.has(`Training ${l}`)) return `Training ${l}`;
+  return 'Neues Training';
+}
+
+async function saveSessionAsTemplate(s) {
+  const items = sessionToItems(s);
+  if (!items.length) return toast('Dieses Training enthält keine Sätze.');
+  const name = await promptName({ title: 'Als Vorlage speichern', value: suggestName(), hint: `${items.length} ${items.length === 1 ? 'Übung' : 'Übungen'} mit den Sätzen und Gewichten aus diesem Training. Du kannst alles danach noch ändern.` });
+  if (!name) return;
+  const t = await saveTemplate({ name, items });
+  render();
+  toast(`„${t.name}“ gespeichert`, { label: 'Bearbeiten', run: () => openTemplateEditor(t) });
+}
+
+// src: { template } oder { session } (Wiederholen) oder nichts (freies Training)
+async function startTraining(src) {
   if (state.activeId) { setTab('training'); return; }
   initAudio();
+  closeTemplateEditor();
   const s = { id: uid(), start: Date.now(), end: null, entries: [], note: '' };
-  if (template) s.entries = template.entries.map((e) => ({ id: uid(), exId: e.exId, sets: [] }));
+  if (src?.template) {
+    s.entries = src.template.items.filter((it) => exById(it.exId)).map(itemToEntry);
+    s.templateId = src.template.id;
+  } else if (src?.session) {
+    s.entries = sessionToItems(src.session).map(itemToEntry);
+  }
+  ui.drafts.clear();
   await saveSession(s);
   await setActive(s.id);
   requestPersist();
@@ -297,7 +448,8 @@ async function startTraining(template) {
   ui.tab = 'training';
   ui.editing = null;
   render();
-  if (!template) openExercisePicker(s);
+  window.scrollTo(0, 0);
+  if (!src) openExercisePicker(s);
 }
 function sessionWakeOn() { if (!ui.sessionWake) { ui.sessionWake = true; wakeOn(); } }
 function sessionWakeOff() { if (ui.sessionWake) { ui.sessionWake = false; wakeOff(); } }
@@ -318,11 +470,13 @@ function renderEditor(s, mode) {
   const live = mode === 'live';
   setTitle(live ? 'Training läuft' : 'Training bearbeiten');
   const setCount = s.entries.reduce((n, e) => n + e.sets.length, 0);
+  const planCount = s.entries.reduce((n, e) => n + (e.plan?.length || 0), 0);
+  const tpl = s.templateId && templateById(s.templateId);
   const head = live ? `
     <div class="live-head">
       <div>
         <div class="live-clock" data-live-clock>${clock(sessionDuration(s))}</div>
-        <div class="live-meta">seit ${fmtTime(s.start)} Uhr, ${setCount === 1 ? '1 Satz' : `${setCount} Sätze`}</div>
+        <div class="live-meta">${tpl ? `${esc(tpl.name)}, ` : ''}seit ${fmtTime(s.start)} Uhr, ${setCount === 1 ? '1 Satz' : `${setCount} Sätze`}${planCount ? `, ${planCount} offen` : ''}</div>
       </div>
       <button class="btn" data-act="finish">Beenden</button>
     </div>` : `
@@ -351,6 +505,8 @@ function renderEditor(s, mode) {
 
 function defaultDraft(s, entry) {
   const ex = exById(entry.exId);
+  const next = entry.plan?.[0];
+  if (next) return { w: next.w ?? null, r: next.r ?? null, t: next.t ?? null };
   const lastSet = entry.sets[entry.sets.length - 1];
   if (lastSet) return { w: lastSet.w ?? null, r: lastSet.r ?? null, t: lastSet.t ?? null };
   const prev = lastPerformance(entry.exId, s.id);
@@ -373,21 +529,38 @@ function draftFor(s, entry) {
 function entryCard(s, entry, live) {
   const ex = exById(entry.exId);
   const metric = ex?.metric || 'reps';
-  const showW = ex?.instrument !== 'bw' || entry.sets.some((x) => x.w);
+  const plan = entry.plan || [];
+  const showW = ex?.instrument !== 'bw' || entry.sets.some((x) => x.w) || plan.some((x) => x.w);
   const showR = metric !== 'time';
   const showT = metric !== 'reps';
   const prev = lastPerformance(entry.exId, s.id);
   const d = draftFor(s, entry);
   const repLabel = ex?.side === 'one' ? 'Wdh je Seite' : 'Wdh';
 
-  const rows = entry.sets.map((set, i) => `
-    <tr class="${set.id === ui.justAdded ? 'just-added' : ''}" data-set="${set.id}">
-      <td>${i + 1}</td>
+  const cells = (set) => `
       ${showW ? `<td><span class="w-cell">${set.w && ex?.instrument === 'kb' ? weightDot(set.w) : ''}${weightText(ex, set.w)}</span></td>` : ''}
       ${showR ? `<td>${set.r ? num(set.r) : '–'}${set.tag ? ` <span class="tiny muted">${esc(set.tag)}</span>` : ''}</td>` : ''}
-      ${showT ? `<td>${set.t ? setTime(set.t) : '–'}${!showR && set.tag ? ` <span class="tiny muted">${esc(set.tag)}</span>` : ''}</td>` : ''}
+      ${showT ? `<td>${set.t ? setTime(set.t) : '–'}${!showR && set.tag ? ` <span class="tiny muted">${esc(set.tag)}</span>` : ''}</td>` : ''}`;
+  const rows = entry.sets.map((set, i) => `
+    <tr class="${set.id === ui.justAdded ? 'just-added' : ''}" data-set="${set.id}">
+      <td>${i + 1}</td>${cells(set)}
       <td><button class="icon-btn" data-act="edit-set" aria-label="Satz ${i + 1} bearbeiten">${ICON.more}</button></td>
+    </tr>`).join('') + plan.map((p, i) => `
+    <tr class="planned" data-act="plan-edit" data-plan="${p.id}">
+      <td>${entry.sets.length + i + 1}</td>${cells(p)}
+      <td><button class="check-btn" data-act="plan-done" aria-label="Satz ${entry.sets.length + i + 1} erledigt">${ICON.check}</button></td>
     </tr>`).join('');
+
+  // Geplanter Timer (EMOM / Countdown aus einer Vorlage)
+  let timerPlan = '';
+  if (entry.timer) {
+    const tm = entry.timer;
+    const what = itemSummary(ex, { timer: tm });
+    timerPlan = `<div class="plan-timer${tm.done ? ' done' : ''}">
+      <div class="grow"><div class="tiny muted">${tm.done ? 'Erledigt' : 'Geplant'}</div><div class="t">${esc(what)}</div></div>
+      ${live ? `<button class="btn btn-s ${tm.done ? 'btn-ghost' : 'btn-primary'}" data-act="plan-timer">${tm.done ? 'Nochmal' : `${ICON.play} Start`}</button>` : ''}
+    </div>`;
+  }
 
   // Gewichtsauswahl
   let weightUI = '';
@@ -405,12 +578,13 @@ function entryCard(s, entry, live) {
     <div class="entry-head">
       <div class="grow">
         <div class="entry-title">${esc(exName(ex))}</div>
-        <div class="entry-sub">${ex ? INSTRUMENTS[ex.instrument] : ''}${entry.sets.length ? `, ${entry.sets.length} ${entry.sets.length === 1 ? 'Satz' : 'Sätze'}` : ''}</div>
+        <div class="entry-sub">${ex ? INSTRUMENTS[ex.instrument] : ''}${plan.length ? `, ${entry.sets.length} von ${entry.sets.length + plan.length} Sätzen` : entry.sets.length ? `, ${entry.sets.length} ${entry.sets.length === 1 ? 'Satz' : 'Sätze'}` : ''}</div>
       </div>
       <button class="icon-btn" data-act="entry-menu" aria-label="Optionen für ${esc(exName(ex))}">${ICON.more}</button>
     </div>
     ${prev ? `<div class="entry-last">Letztes Mal (${fmtShort(prev.session.start)}): ${esc(entrySummary(ex, prev.entry))}</div>` : ''}
-    ${entry.sets.length ? `
+    ${timerPlan}
+    ${entry.sets.length || plan.length ? `
       <table class="sets">
         <thead><tr><th>#</th>${showW ? '<th>Gewicht</th>' : ''}${showR ? `<th>${repLabel}</th>` : ''}${showT ? '<th>Zeit</th>' : ''}<th></th></tr></thead>
         <tbody>${rows}</tbody>
@@ -423,7 +597,7 @@ function entryCard(s, entry, live) {
         ${showT ? `<div><span class="composer-label">Zeit${metric === 'both' ? ' (optional)' : ''}</span>${stepper({ field: 't', value: d.t, step: 15, kind: 'time', entry: entry.id, wide: true, label: 'Zeit' })}</div>` : ''}
       </div>
       <div class="actions">
-        <button class="btn btn-primary" data-act="log-set">Satz eintragen</button>
+        <button class="btn btn-primary" data-act="log-set">${plan.length ? `Satz ${entry.sets.length + 1} eintragen` : 'Satz eintragen'}</button>
         ${live ? `
           <button class="btn btn-ghost" data-act="timer-menu" aria-label="Timer">${ICON.timer} Timer</button>` : ''}
       </div>
@@ -470,7 +644,7 @@ function entryFromEl(el) {
   return { s, entry: s?.entries.find((e) => e.id === id) };
 }
 
-async function logSet(s, entry, values, { tag, rest = true } = {}) {
+async function logSet(s, entry, values, { tag, rest = true, planId } = {}) {
   const ex = exById(entry.exId);
   const metric = ex?.metric || 'reps';
   const set = { id: uid(), w: values.w || null, r: values.r || null, t: values.t || null, ts: Date.now() };
@@ -479,6 +653,17 @@ async function logSet(s, entry, values, { tag, rest = true } = {}) {
   if (metric === 'time' && !set.t) return toast('Trag noch die Zeit ein.');
   if (metric === 'both' && !set.r && !set.t) return toast('Trag Wiederholungen oder Zeit ein.');
   entry.sets.push(set);
+  // geplanten Satz abhaken
+  if (planId && entry.plan) {
+    const p = entry.plan.find((x) => x.id === planId);
+    entry.plan = entry.plan.filter((x) => x.id !== planId);
+    // Anderes Gewicht gewählt und die übrigen Sätze hatten alle das alte Gewicht? Dann übernehmen.
+    if (p && set.w && p.w !== set.w && entry.plan.length && entry.plan.every((x) => x.w === p.w)) {
+      entry.plan.forEach((x) => { x.w = set.w; });
+      setTimeout(() => toast(`${weightText(ex, set.w)} auch für die übrigen Sätze`), 50);
+    }
+    ui.drafts.delete(entry.id);
+  }
   if (!s.end) { /* laufend */ } else s.edited = Date.now();
   await saveSession(s);
   ui.justAdded = set.id;
@@ -496,7 +681,10 @@ view.addEventListener('click', async (e) => {
   switch (act) {
     case 'start': return startTraining();
     case 'backfill': return backfill();
-    case 'repeat': return startTraining(sessionById(a.dataset.id));
+    case 'repeat': return startTraining({ session: sessionById(a.dataset.id) });
+    case 'save-as-tpl': return saveSessionAsTemplate(sessionById(a.dataset.id));
+    case 'tpl-new': return newTemplate();
+    case 'tpl-open': return openTemplateSheet(templateById(a.dataset.id));
     case 'starter': return addStarter();
     case 'new-exercise': return openExerciseForm();
     case 'backup-now': return doBackup();
@@ -506,7 +694,7 @@ view.addEventListener('click', async (e) => {
       const s = currentSession();
       const last = finishedSessions()[0];
       if (!last) return;
-      s.entries.push(...last.entries.map((x) => ({ id: uid(), exId: x.exId, sets: [] })));
+      s.entries.push(...sessionToItems(last).map(itemToEntry));
       await saveSession(s);
       return render();
     }
@@ -551,7 +739,24 @@ view.addEventListener('click', async (e) => {
     }
     case 'log-set': {
       const { s, entry } = entryFromEl(a);
-      return logSet(s, entry, draftFor(s, entry));
+      return logSet(s, entry, draftFor(s, entry), { planId: entry.plan?.[0]?.id });
+    }
+    case 'plan-done': {
+      e.stopPropagation();
+      const { s, entry } = entryFromEl(a);
+      const p = entry.plan?.find((x) => x.id === a.closest('[data-plan]').dataset.plan);
+      if (p) return logSet(s, entry, p, { planId: p.id });
+      return;
+    }
+    case 'plan-edit': {
+      const { s, entry } = entryFromEl(a);
+      const p = entry.plan?.find((x) => x.id === a.dataset.plan);
+      if (p) return openPlanEditor(s, entry, p);
+      return;
+    }
+    case 'plan-timer': {
+      const { s, entry } = entryFromEl(a);
+      return startPlannedTimer(s, entry);
     }
     case 'edit-set': {
       const { s, entry } = entryFromEl(a);
@@ -574,11 +779,7 @@ function openSetEditor(s, entry, set) {
   const metric = ex?.metric || 'reps';
   openSheet({
     title: `Satz ${entry.sets.indexOf(set) + 1}`,
-    body: `<div class="stack">
-      ${ex?.instrument !== 'bw' || set.w ? `<label class="field"><span>${ex?.instrument === 'bw' ? 'Zusatzgewicht' : ex?.side === 'double' ? 'Gewicht je Kugel' : 'Gewicht'} (kg)</span>${stepper({ field: 'w', value: set.w ?? '', step: ex?.instrument === 'kb' ? 4 : 2.5, wide: true, label: 'Gewicht' })}</label>` : `<label class="field"><span>Zusatzgewicht (kg)</span>${stepper({ field: 'w', value: 0, step: 2.5, wide: true, label: 'Gewicht' })}</label>`}
-      ${metric !== 'time' ? `<label class="field"><span>${ex?.side === 'one' ? 'Wiederholungen je Seite' : 'Wiederholungen'}</span>${stepper({ field: 'r', value: set.r ?? '', label: 'Wiederholungen' })}</label>` : ''}
-      ${metric !== 'reps' ? `<label class="field"><span>Zeit (Minuten:Sekunden)</span>${stepper({ field: 't', value: set.t, step: 15, kind: 'time', wide: true, label: 'Zeit' })}</label>` : ''}
-    </div>`,
+    body: `<div class="stack">${setFields(ex, metric, set)}</div>`,
     foot: `<button class="btn btn-danger" data-del>${ICON.trash} Löschen</button><button class="btn btn-primary" data-save>Speichern</button>`,
     onMount: (sh, close) => {
       sh.querySelector('[data-save]').onclick = async () => {
@@ -598,6 +799,61 @@ function openSetEditor(s, entry, set) {
       };
     },
   });
+}
+
+// Geplanten Satz anpassen, entfernen oder mit geänderten Werten abhaken
+function openPlanEditor(s, entry, p) {
+  const ex = exById(entry.exId);
+  const metric = ex?.metric || 'reps';
+  const n = entry.sets.length + entry.plan.indexOf(p) + 1;
+  openSheet({
+    title: `Satz ${n} (geplant)`,
+    body: `<div class="stack">${setFields(ex, metric, p)}</div>`,
+    foot: `<button class="btn btn-danger" data-del aria-label="Geplanten Satz entfernen">${ICON.trash}</button>
+      <button class="btn btn-ghost" data-save>Ändern</button>
+      <button class="btn btn-primary" data-done>${ICON.check} Erledigt</button>`,
+    onMount: (sh, close) => {
+      const read = () => { for (const inp of $$('input[data-field]', sh)) p[inp.dataset.field] = readStepper(inp) || null; };
+      const after = () => { close(); const y = window.scrollY; render(); window.scrollTo(0, y); };
+      sh.querySelector('[data-save]').onclick = async () => {
+        read(); ui.drafts.delete(entry.id);
+        await saveSession(s); after();
+      };
+      sh.querySelector('[data-done]').onclick = async () => {
+        read(); close();
+        await logSet(s, entry, p, { planId: p.id });
+      };
+      sh.querySelector('[data-del]').onclick = async () => {
+        entry.plan = entry.plan.filter((x) => x !== p);
+        ui.drafts.delete(entry.id);
+        await saveSession(s); after();
+      };
+    },
+  });
+}
+
+// Eingabefelder für einen Satz (Gewicht, Wdh, Zeit) – im Satz-, Plan- und Vorlagen-Editor
+function setFields(ex, metric, set) {
+  const wLabel = ex?.instrument === 'bw' ? 'Zusatzgewicht' : ex?.side === 'double' ? 'Gewicht je Kugel' : 'Gewicht';
+  return `
+    <label class="field"><span>${wLabel} (kg)</span>${stepper({ field: 'w', value: set.w ?? (ex?.instrument === 'bw' ? 0 : ''), step: ex?.instrument === 'kb' ? 4 : 2.5, wide: true, label: 'Gewicht' })}</label>
+    ${metric !== 'time' ? `<label class="field"><span>${ex?.side === 'one' ? 'Wiederholungen je Seite' : 'Wiederholungen'}</span>${stepper({ field: 'r', value: set.r ?? '', label: 'Wiederholungen' })}</label>` : ''}
+    ${metric !== 'reps' ? `<label class="field"><span>Zeit (Minuten:Sekunden)${metric === 'both' ? ', optional' : ''}</span>${stepper({ field: 't', value: set.t, step: 15, kind: 'time', wide: true, label: 'Zeit' })}</label>` : ''}`;
+}
+
+// Geplanten EMOM/Countdown direkt mit den Vorgaben starten
+function startPlannedTimer(s, entry) {
+  const ex = exById(entry.exId);
+  const tm = entry.timer;
+  const d = draftFor(s, entry);
+  if (tm.w) d.w = tm.w;
+  if (tm.mode === 'emom') {
+    if (tm.r) d.r = tm.r;
+    const cfg = { interval: tm.interval, rounds: tm.rounds, r: tm.r, t: tm.t };
+    startTimer({ mode: 'emom', title: exName(ex), interval: tm.interval, rounds: tm.rounds, onDone: (res) => emomResult(s, entry, cfg, res) });
+  } else {
+    startTimer({ mode: 'countdown', title: exName(ex), total: tm.total, onDone: (res) => countdownResult(s, entry, tm.total, res) });
+  }
 }
 
 function openEntryMenu(s, entry) {
@@ -716,7 +972,7 @@ function emomResult(s, entry, cfg, res) {
       <p class="muted">Jede Runde wird als eigener Satz eingetragen${d.w ? ` (${weightText(ex, d.w)})` : ''}.</p>
       <label class="field"><span>Geschaffte Runden</span>${stepper({ field: 'n', value: rounds, min: 0, max: 99, label: 'Runden' })}</label>
       ${metric !== 'time' ? `<label class="field"><span>${ex?.side === 'one' ? 'Wiederholungen je Runde (je Seite)' : 'Wiederholungen je Runde'}</span>${stepper({ field: 'r', value: cfg.r ?? d.r ?? 5, label: 'Wiederholungen' })}</label>` : ''}
-      ${metric !== 'reps' ? `<label class="field"><span>Arbeitszeit je Runde${metric === 'both' ? ' (optional)' : ''}</span>${stepper({ field: 't', value: metric === 'time' ? 30 : null, step: 5, kind: 'time', wide: true, label: 'Zeit' })}</label>` : ''}
+      ${metric !== 'reps' ? `<label class="field"><span>Arbeitszeit je Runde${metric === 'both' ? ' (optional)' : ''}</span>${stepper({ field: 't', value: cfg.t ?? (metric === 'time' ? 30 : null), step: 5, kind: 'time', wide: true, label: 'Zeit' })}</label>` : ''}
     </div>`,
     foot: `<button class="btn btn-ghost" data-close>Nicht eintragen</button><button class="btn btn-primary" data-save>Eintragen</button>`,
     onMount: (sh, close) => {
@@ -729,6 +985,7 @@ function emomResult(s, entry, cfg, res) {
         for (let i = 0; i < n; i++) {
           entry.sets.push({ id: uid(), w: d.w || null, r: v.r || null, t: v.t || null, ts: now + i, tag });
         }
+        if (entry.timer) entry.timer.done = true;
         await saveSession(s);
         close();
         render();
@@ -789,6 +1046,7 @@ function countdownResult(s, entry, total, res) {
         let r = v.r || null;
         if (r && one) r = r / 2;
         close();
+        if (entry.timer) entry.timer.done = true;
         await logSet(s, entry, { w: d.w, r, t: v.t }, { tag: 'AMRAP', rest: false });
       };
     },
@@ -805,6 +1063,10 @@ async function finishTraining() {
   }
   const dur = sessionDuration(s);
   const vol = sessionVolume(s);
+  const open = s.entries.reduce((n, e) => n + (e.plan?.length || 0), 0);
+  const tpl = s.templateId && templateById(s.templateId);
+  const merged = tpl ? mergeIntoTemplate(tpl, s) : null;
+  const changed = tpl && itemsSignature(merged) !== itemsSignature(tpl.items);
   openSheet({
     title: 'Training beenden',
     body: `<dl class="kv">
@@ -812,38 +1074,84 @@ async function finishTraining() {
         <dt>Übungen</dt><dd>${s.entries.filter((e) => e.sets.length).length}</dd>
         <dt>Sätze</dt><dd>${sets}</dd>
         ${vol ? `<dt>Volumen</dt><dd>${num(vol, 0)} kg</dd>` : ''}
-      </dl>`,
+      </dl>
+      ${open ? `<p class="small muted" style="margin-top:12px">${open === 1 ? 'Ein geplanter Satz ist' : `${open} geplante Sätze sind`} nicht abgehakt und werden nicht gespeichert.</p>` : ''}
+      <div class="divider"></div>
+      ${tpl ? (changed ? `
+        <label class="switch"><span>Vorlage „${esc(tpl.name)}“ mit den heutigen Sätzen und Gewichten aktualisieren</span><input type="checkbox" data-upd></label>
+        <p class="small muted">Dann startet das Training nächstes Mal mit den Werten von heute. Ausgelassene Übungen bleiben in der Vorlage.</p>`
+        : `<p class="small muted">Genau wie in der Vorlage „${esc(tpl.name)}“.</p>`) : `
+        <label class="switch"><span>Als Vorlage speichern</span><input type="checkbox" data-new></label>
+        <label class="field" data-name-wrap hidden><span>Name der Vorlage</span><input type="text" data-tname value="${esc(suggestName())}" autocomplete="off"></label>`}`,
     foot: `<button class="btn btn-ghost" data-close>Weiter trainieren</button><button class="btn btn-primary" data-ok>Speichern</button>`,
     onMount: (sh, close) => {
+      const chkNew = sh.querySelector('[data-new]');
+      chkNew?.addEventListener('change', () => { sh.querySelector('[data-name-wrap]').hidden = !chkNew.checked; });
       sh.querySelector('[data-ok]').onclick = async () => {
+        const upd = sh.querySelector('[data-upd]')?.checked;
+        const asNew = chkNew?.checked;
+        const tname = sh.querySelector('[data-tname]')?.value.trim() || suggestName();
         s.end = Date.now();
         s.entries = s.entries.filter((e) => e.sets.length);
+        for (const e of s.entries) { delete e.plan; delete e.timer; }
         clearTimeout(saveTimer);
         await saveSession(s);
         await setActive(null);
         stopRest();
         sessionWakeOff();
         ui.drafts.clear();
+        let msg = 'Training gespeichert';
+        if (tpl) {
+          tpl.lastUsed = s.start;
+          if (upd) { tpl.items = merged; msg = 'Training gespeichert, Vorlage aktualisiert'; }
+          await saveTemplate(tpl);
+        } else if (asNew) {
+          const items = sessionToItems(s);
+          const t = await saveTemplate({ name: tname, items, lastUsed: s.start });
+          s.templateId = t.id;
+          await saveSession(s);
+          msg = `Gespeichert, neue Vorlage „${t.name}“`;
+        }
         close();
         render();
         window.scrollTo(0, 0);
-        toast('Training gespeichert');
+        toast(msg);
       };
     },
   });
 }
 
+// Heutige Werte in die Vorlage übernehmen: gleiche Übungen ersetzen, ausgelassene behalten, neue anhängen
+function mergeIntoTemplate(tpl, s) {
+  const done = s.entries.filter((e) => e.sets.length);
+  const used = new Set();
+  const items = tpl.items.map((it) => {
+    const e = done.find((x) => x.exId === it.exId && !used.has(x));
+    if (!e) return it;
+    used.add(e);
+    const n = entryToItem(e);
+    n.id = it.id;
+    return n;
+  });
+  for (const e of done) if (!used.has(e)) items.push(entryToItem(e));
+  return items;
+}
+
 // ---------- Übungsauswahl ----------
-function openExercisePicker(s) {
+// s: Einheit, zu der die Übungen hinzukommen. Alternativ onPick(ids) für andere Ziele (Vorlagen).
+function openExercisePicker(s, onPick) {
+  const addIds = onPick || (async (ids) => {
+    for (const id of ids) s.entries.push({ id: uid(), exId: id, sets: [] });
+    if (s.end) s.edited = Date.now();
+    await saveSession(s);
+    render();
+  });
   if (!state.exercises.filter((e) => !e.archived).length) {
-    return openExerciseForm(null, async (ex) => {
-      s.entries.push({ id: uid(), exId: ex.id, sets: [] });
-      await saveSession(s); render();
-    });
+    return openExerciseForm(null, (ex) => addIds([ex.id]));
   }
   const recent = [];
   for (const ses of state.sessions) {
-    if (ses.id === s.id) continue;
+    if (ses.id === s?.id) continue;
     for (const e of ses.entries) if (!recent.includes(e.exId) && exById(e.exId) && !exById(e.exId).archived) recent.push(e.exId);
     if (recent.length >= 6) break;
   }
@@ -889,19 +1197,13 @@ function openExercisePicker(s) {
         });
       });
       addBtn.onclick = async () => {
-        for (const id of chosen) s.entries.push({ id: uid(), exId: id, sets: [] });
-        if (s.end) s.edited = Date.now();
-        await saveSession(s);
         close();
-        render();
+        await addIds([...chosen]);
         setTimeout(() => $$('.entry').at(-1)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
       };
       sh.querySelector('[data-new]').onclick = () => {
         close();
-        setTimeout(() => openExerciseForm(null, async (ex) => {
-          s.entries.push({ id: uid(), exId: ex.id, sets: [] });
-          await saveSession(s); render();
-        }), 50);
+        setTimeout(() => openExerciseForm(null, (ex) => addIds([ex.id])), 50);
       };
     },
   });
@@ -912,6 +1214,7 @@ function openExerciseForm(ex, onSaved) {
   const isNew = !ex;
   const draft = ex ? { ...ex } : { name: '', instrument: 'kb', side: 'both', metric: 'reps' };
   const usage = ex ? exerciseUsage(ex.id) : 0;
+  const inTpl = ex ? exerciseTemplates(ex.id) : [];
   openSheet({
     title: isNew ? 'Neue Übung' : 'Übung bearbeiten',
     body: `<div class="stack">
@@ -922,6 +1225,7 @@ function openExerciseForm(ex, onSaved) {
       <p class="small" style="color:var(--danger)" data-err hidden></p>
       ${!isNew ? `<div class="divider"></div>
         <p class="small muted">${usage ? `In ${usage} ${usage === 1 ? 'Training' : 'Trainings'} verwendet. ${ex.archived ? 'Diese Übung ist ausgeblendet.' : 'Ausgeblendete Übungen erscheinen nicht mehr in der Auswahl, bleiben aber im Verlauf erhalten.'}` : 'Noch in keinem Training verwendet.'}</p>
+        ${inTpl.length ? `<p class="small muted">Teil von: ${esc(inTpl.map((t) => t.name).join(', '))}.${usage ? '' : ' Beim Löschen wird sie dort entfernt.'}</p>` : ''}
         ${usage ? `<button class="btn btn-ghost btn-block" data-archive>${ex.archived ? 'Wieder einblenden' : 'Ausblenden'}</button>` : `<button class="btn btn-danger btn-block" data-delete>${ICON.trash} Übung löschen</button>`}` : ''}
     </div>`,
     foot: `<button class="btn btn-ghost" data-close>Abbrechen</button><button class="btn btn-primary" data-save>Speichern</button>`,
@@ -981,6 +1285,298 @@ async function addStarter() {
 }
 
 // =====================================================================
+// Vorlagen-Editor („Meine Trainings“ zusammenstellen)
+// =====================================================================
+async function newTemplate() {
+  const t = await saveTemplate({ name: '', items: [] });
+  openTemplateEditor(t);
+  setTimeout(() => openExercisePicker(null, (ids) => addTemplateItems(t, ids)), 120);
+}
+function openTemplateEditor(t) {
+  ui.tplEdit = t.id;
+  ui.editing = null;
+  ui.tab = 'training';
+  render();
+  window.scrollTo(0, 0);
+}
+// Beim Verlassen: leere Vorlagen verwerfen, fehlenden Namen ergänzen
+function closeTemplateEditor() {
+  if (!ui.tplEdit) return null;
+  const t = templateById(ui.tplEdit);
+  ui.tplEdit = null;
+  clearTimeout(tplSaveTimer);
+  if (!t) return null;
+  if (!t.items.length) { deleteTemplate(t.id); return null; }
+  if (!t.name?.trim()) t.name = suggestName();
+  saveTemplate(t);
+  return t;
+}
+let tplSaveTimer;
+function debounceTpl(t) { clearTimeout(tplSaveTimer); tplSaveTimer = setTimeout(() => saveTemplate(t), 400); }
+function rerender() { const y = window.scrollY; render(); window.scrollTo(0, y); }
+
+// Neuer Baustein: Werte vom letzten Mal, sonst 3 Sätze mit Standardwerten
+function newItem(exId) {
+  const prev = lastPerformance(exId);
+  if (prev) {
+    const it = entryToItem(prev.entry);
+    if (it.sets.length || it.timer) return it;
+  }
+  const d = defaultDraft({ id: null }, { exId, sets: [] });
+  return { id: uid(), exId, sets: [0, 1, 2].map(() => ({ ...d })), timer: null };
+}
+async function addTemplateItems(t, ids) {
+  for (const id of ids) t.items.push(newItem(id));
+  await saveTemplate(t);
+  if (ui.tplEdit === t.id) rerender();
+}
+
+function tplSetsTable(ex, sets, label = '') {
+  const metric = ex?.metric || 'reps';
+  const showW = ex?.instrument !== 'bw' || sets.some((x) => x.w);
+  const showR = metric !== 'time';
+  const showT = metric !== 'reps';
+  if (!sets.length) return '';
+  return `${label ? `<div class="composer-label" style="margin-top:12px">${label}</div>` : ''}
+    <table class="sets tpl-sets">
+      <thead><tr><th>#</th>${showW ? '<th>Gewicht</th>' : ''}${showR ? `<th>${ex?.side === 'one' ? 'Wdh je Seite' : 'Wdh'}</th>` : ''}${showT ? '<th>Zeit</th>' : ''}<th></th></tr></thead>
+      <tbody>${sets.map((set, i) => `
+        <tr data-act="tset-edit" data-idx="${i}">
+          <td>${i + 1}</td>
+          ${showW ? `<td><span class="w-cell">${set.w && ex?.instrument === 'kb' ? weightDot(set.w) : ''}${weightText(ex, set.w)}</span></td>` : ''}
+          ${showR ? `<td>${set.r ? num(set.r) : '–'}</td>` : ''}
+          ${showT ? `<td>${set.t ? setTime(set.t) : '–'}</td>` : ''}
+          <td><span class="icon-btn" aria-hidden="true">${ICON.more}</span></td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+function tplItemCard(it, i, count) {
+  const ex = exById(it.exId);
+  const metric = ex?.metric || 'reps';
+  const mode = it.timer?.mode || 'sets';
+  let body = '';
+  if (mode === 'sets') {
+    body = `${tplSetsTable(ex, it.sets)}
+      <div class="row" style="margin-top:10px"><button class="btn btn-ghost btn-s" data-act="tset-add">${ICON.plus} Satz</button>
+      <span class="small muted grow">Tippe auf einen Satz, um ihn zu ändern.</span></div>`;
+  } else {
+    const tm = it.timer;
+    let weight = '';
+    if (ex?.instrument === 'kb') {
+      const list = [...new Set([...state.settings.bells, ...(tm.w ? [tm.w] : [])])].sort((a, b) => a - b);
+      weight = `<div class="grow-full"><span class="composer-label">${ex.side === 'double' ? 'Gewicht je Kugel' : 'Kugel'}</span>
+        <div class="bells" role="group" aria-label="Kugel wählen">${list.map((w) => `
+          <button class="bell" data-act="tbell" data-w="${w}" aria-pressed="${w === tm.w}" aria-label="${num(w)} Kilogramm">${bellSvg(w)}</button>`).join('')}</div></div>`;
+    } else if (ex?.instrument !== 'bw' || tm.w) {
+      weight = `<div><span class="composer-label">${ex?.instrument === 'bw' ? 'Zusatzgewicht kg' : 'Gewicht kg'}</span>${stepper({ field: 'w', value: tm.w ?? '', step: 2.5, wide: true, label: 'Gewicht' })}</div>`;
+    }
+    body = `<div class="composer-row tpl-timer" data-timer>
+      ${weight}
+      ${mode === 'emom' ? `
+        <div><span class="composer-label">Intervall</span>${stepper({ field: 'interval', value: tm.interval, step: 15, min: 10, kind: 'time', wide: true, label: 'Intervall' })}</div>
+        <div><span class="composer-label">Runden</span>${stepper({ field: 'rounds', value: tm.rounds, min: 1, max: 99, label: 'Runden' })}</div>
+        ${metric !== 'time' ? `<div><span class="composer-label">${ex?.side === 'one' ? 'Wdh je Runde und Seite' : 'Wdh je Runde'}</span>${stepper({ field: 'r', value: tm.r ?? '', label: 'Wiederholungen' })}</div>` : ''}
+        ${metric === 'time' ? `<div><span class="composer-label">Arbeitszeit je Runde</span>${stepper({ field: 't', value: tm.t ?? 30, step: 5, kind: 'time', wide: true, label: 'Zeit' })}</div>` : ''}` : `
+        <div><span class="composer-label">Dauer</span>${stepper({ field: 'total', value: tm.total, step: 30, min: 10, kind: 'time', wide: true, label: 'Dauer' })}</div>`}
+    </div>
+    ${tplSetsTable(ex, it.sets, 'Zusätzliche Sätze')}`;
+  }
+  return `<section class="entry" data-item="${it.id}">
+    <div class="entry-head">
+      <div class="grow">
+        <div class="entry-title">${esc(exName(ex))}</div>
+        <div class="entry-sub" data-isum>${esc(itemSummary(ex, it))}</div>
+      </div>
+      <button class="icon-btn" data-act="titem-menu" aria-label="Optionen für ${esc(exName(ex))}">${ICON.more}</button>
+    </div>
+    <div class="tpl-body">
+      ${seg('mode', { sets: 'Sätze', emom: 'EMOM', countdown: 'Countdown' }, mode)}
+      ${body}
+    </div>
+  </section>`;
+}
+
+function renderTemplateEditor(t) {
+  setTitle(state.templates.includes(t) && t.name ? 'Vorlage bearbeiten' : 'Neue Vorlage');
+  $('#appbar-extra').innerHTML = `<button class="btn btn-s btn-primary" data-top="tpl-done">Fertig</button>`;
+  const items = t.items.filter((it) => exById(it.exId));
+  view.dataset.session = '';
+  view.innerHTML = `
+    <div class="panel tpl-head">
+      <label class="field"><span>Name</span><input type="text" data-tpl="name" value="${esc(t.name)}" placeholder="z. B. Swing-Tag oder Ganzkörper A" autocomplete="off"></label>
+    </div>
+    ${items.length ? items.map((it, i) => tplItemCard(it, i, items.length)).join('') : `
+      <div class="empty"><h2>Noch keine Übungen</h2><p>Füge die Übungen hinzu, die zu diesem Training gehören.</p></div>`}
+    <div class="stack" style="margin-top:16px">
+      <button class="btn btn-ghost btn-block" data-act="tpl-add">${ICON.plus} Übung hinzufügen</button>
+      <button class="btn btn-primary btn-block" data-act="tpl-done">Fertig</button>
+      ${!state.activeId && items.length ? `<button class="btn btn-text btn-block" data-act="tpl-start">${ICON.play} Speichern und jetzt starten</button>` : ''}
+      ${t.items.length ? '<button class="btn btn-danger btn-block" data-act="tpl-delete">Vorlage löschen</button>' : ''}
+    </div>`;
+}
+
+function itemFromEl(el) {
+  const t = templateById(ui.tplEdit);
+  const id = el.closest('[data-item]')?.dataset.item;
+  return { t, it: t?.items.find((x) => x.id === id) };
+}
+
+function switchItemMode(it, mode) {
+  const ex = exById(it.exId);
+  const d = defaultDraft({ id: null }, { exId: it.exId, sets: [] });
+  if (mode === 'sets') {
+    if (!it.sets.length) {
+      const b = it.timer || d;
+      it.sets = [0, 1, 2].map(() => ({ w: b.w ?? d.w, r: b.r ?? d.r, t: b.t ?? d.t }));
+    }
+    it.timer = null;
+    return;
+  }
+  const b = it.sets[0] || it.timer || d;
+  if (mode === 'emom') {
+    const saved = state.settings.lastEmom || { interval: 60, rounds: 10 };
+    it.timer = { mode: 'emom', interval: saved.interval, rounds: it.sets.length >= 5 ? it.sets.length : saved.rounds, r: ex?.metric === 'time' ? null : (b.r ?? 5), w: b.w ?? null, t: ex?.metric === 'time' ? (b.t ?? 30) : null };
+  } else {
+    it.timer = { mode: 'countdown', total: state.settings.lastCountdown || 600, w: b.w ?? null };
+  }
+  it.sets = [];
+}
+
+function openTplSetEditor(t, it, idx) {
+  const ex = exById(it.exId);
+  const metric = ex?.metric || 'reps';
+  const set = it.sets[idx];
+  const same = (a, b) => a.w === b.w && a.r === b.r && a.t === b.t;
+  const allSame = it.sets.length > 1 && it.sets.every((x) => same(x, set));
+  openSheet({
+    title: `Satz ${idx + 1}`,
+    body: `<div class="stack">${setFields(ex, metric, set)}
+      ${it.sets.length > 1 ? `<label class="switch"><span>Für alle ${it.sets.length} Sätze übernehmen</span><input type="checkbox" data-all ${allSame ? 'checked' : ''}></label>` : ''}</div>`,
+    foot: `<button class="btn btn-danger" data-del>${ICON.trash} Löschen</button><button class="btn btn-primary" data-save>Speichern</button>`,
+    onMount: (sh, close) => {
+      sh.querySelector('[data-save]').onclick = async () => {
+        const v = Object.fromEntries($$('input[data-field]', sh).map((i) => [i.dataset.field, readStepper(i) || null]));
+        const targets = sh.querySelector('[data-all]')?.checked ? it.sets : [set];
+        for (const x of targets) Object.assign(x, v);
+        await saveTemplate(t);
+        close(); rerender();
+      };
+      sh.querySelector('[data-del]').onclick = async () => {
+        it.sets.splice(idx, 1);
+        await saveTemplate(t);
+        close(); rerender();
+      };
+    },
+  });
+}
+
+function openItemMenu(t, it) {
+  const ex = exById(it.exId);
+  const i = t.items.indexOf(it);
+  openSheet({
+    title: exName(ex),
+    body: `<div class="list">
+      ${i > 0 ? `<button class="list-item" data-m="up"><span class="grow t">Nach oben schieben</span></button>` : ''}
+      ${i < t.items.length - 1 ? `<button class="list-item" data-m="down"><span class="grow t">Nach unten schieben</span></button>` : ''}
+      <button class="list-item" data-m="last"><span class="grow t">Werte vom letzten Training übernehmen</span></button>
+      <button class="list-item" data-m="remove"><span class="grow t" style="color:var(--danger)">Aus der Vorlage entfernen</span></button>
+    </div>`,
+    onMount: (sh, close) => sh.addEventListener('click', async (e) => {
+      const m = e.target.closest('[data-m]')?.dataset.m;
+      if (!m) return;
+      if (m === 'up' || m === 'down') {
+        const j = m === 'up' ? i - 1 : i + 1;
+        [t.items[i], t.items[j]] = [t.items[j], t.items[i]];
+      } else if (m === 'last') {
+        const prev = lastPerformance(it.exId);
+        if (!prev) { close(); return toast('Diese Übung hast du noch nicht trainiert.'); }
+        Object.assign(it, entryToItem(prev.entry), { id: it.id });
+      } else if (m === 'remove') {
+        t.items = t.items.filter((x) => x !== it);
+      }
+      await saveTemplate(t);
+      close(); rerender();
+    }),
+  });
+}
+
+// Eingaben im Vorlagen-Editor
+view.addEventListener('input', (e) => {
+  if (!ui.tplEdit) return;
+  const t = templateById(ui.tplEdit);
+  if (!t) return;
+  const el = e.target;
+  if (el.dataset.tpl === 'name') { t.name = el.value; debounceTpl(t); return; }
+  if (el.dataset.field && el.closest('[data-timer]')) {
+    const { it } = itemFromEl(el);
+    if (!it?.timer) return;
+    it.timer[el.dataset.field] = readStepper(el);
+    const sum = el.closest('[data-item]').querySelector('[data-isum]');
+    if (sum) sum.textContent = itemSummary(exById(it.exId), it);
+    debounceTpl(t);
+  }
+});
+view.addEventListener('segchange', async (e) => {
+  if (!ui.tplEdit || e.target.dataset.seg !== 'mode') return;
+  const { t, it } = itemFromEl(e.target);
+  if (!it) return;
+  switchItemMode(it, e.detail);
+  await saveTemplate(t);
+  rerender();
+});
+view.addEventListener('click', async (e) => {
+  if (!ui.tplEdit) return;
+  const a = e.target.closest('[data-act]');
+  if (!a) return;
+  const t = templateById(ui.tplEdit);
+  if (!t) return;
+  switch (a.dataset.act) {
+    case 'tpl-add': return openExercisePicker(null, (ids) => addTemplateItems(t, ids));
+    case 'tpl-done': return finishTemplateEditor();
+    case 'tpl-start': {
+      const saved = closeTemplateEditor();
+      if (saved) return startTraining({ template: saved });
+      return render();
+    }
+    case 'tpl-delete': {
+      if (!(await confirmSheet({ title: 'Vorlage löschen?', text: `„${esc(t.name || 'Ohne Namen')}“ wird gelöscht. Deine bisherigen Trainings bleiben im Verlauf erhalten.`, ok: 'Löschen', danger: true }))) return;
+      clearTimeout(tplSaveTimer);
+      await deleteTemplate(t.id);
+      ui.tplEdit = null;
+      render();
+      return toast('Vorlage gelöscht');
+    }
+    case 'titem-menu': { const { it } = itemFromEl(a); return it && openItemMenu(t, it); }
+    case 'tset-edit': { const { it } = itemFromEl(a); return it && openTplSetEditor(t, it, Number(a.dataset.idx)); }
+    case 'tset-add': {
+      const { it } = itemFromEl(a);
+      if (!it) return;
+      const last = it.sets[it.sets.length - 1] || defaultDraft({ id: null }, { exId: it.exId, sets: [] });
+      it.sets.push({ w: last.w ?? null, r: last.r ?? null, t: last.t ?? null });
+      await saveTemplate(t);
+      return rerender();
+    }
+    case 'tbell': {
+      const { it } = itemFromEl(a);
+      if (!it?.timer) return;
+      it.timer.w = Number(a.dataset.w);
+      $$('.bell', a.parentElement).forEach((b) => b.setAttribute('aria-pressed', String(b === a)));
+      const sum = a.closest('[data-item]').querySelector('[data-isum]');
+      if (sum) sum.textContent = itemSummary(exById(it.exId), it);
+      return saveTemplate(t);
+    }
+  }
+});
+function finishTemplateEditor() {
+  const t = closeTemplateEditor();
+  ui.tab = 'training';
+  render();
+  window.scrollTo(0, 0);
+  toast(t ? `„${t.name}“ gespeichert` : 'Leere Vorlage verworfen');
+}
+
+// =====================================================================
 // Übungen
 // =====================================================================
 function renderExercises() {
@@ -1017,6 +1613,7 @@ $('#appbar-extra').addEventListener('click', (e) => {
   const t = e.target.closest('[data-top]')?.dataset.top;
   if (t === 'new-ex') openExerciseForm();
   if (t === 'backfill') backfill();
+  if (t === 'tpl-done') finishTemplateEditor();
 });
 
 // =====================================================================
@@ -1026,9 +1623,10 @@ function historyItem(s) {
   const names = [...new Set(s.entries.map((e) => exName(exById(e.exId))))];
   const sets = s.entries.reduce((n, e) => n + e.sets.length, 0);
   const live = s.id === state.activeId;
+  const tpl = s.templateId && templateById(s.templateId);
   return `<button class="list-item" data-act="open-session" data-id="${s.id}">
     <div class="grow">
-      <div class="t">${fmtDay(s.start)} ${live ? '<span class="badge badge-live">läuft</span>' : ''}</div>
+      <div class="t">${fmtDay(s.start)} ${live ? '<span class="badge badge-live">läuft</span>' : ''}${tpl ? ` <span class="badge">${esc(tpl.name)}</span>` : ''}</div>
       <div class="s">${names.length ? esc(names.join(', ')) : 'keine Übungen'}</div>
     </div>
     <div class="end">${duration(sessionDuration(s))}<br>${sets} ${sets === 1 ? 'Satz' : 'Sätze'}</div>
@@ -1099,7 +1697,8 @@ function openSessionDetail(s) {
             <div class="s">${esc(entrySummary(ex, e))}</div></div></div>`;
         }).join('')}
       </div>
-      ${s.note ? `<p style="margin-top:14px;white-space:pre-wrap">${esc(s.note)}</p>` : ''}`,
+      ${s.note ? `<p style="margin-top:14px;white-space:pre-wrap">${esc(s.note)}</p>` : ''}
+      <button class="btn btn-text btn-block" style="margin-top:12px" data-savetpl>Als Vorlage speichern</button>`,
     foot: `<button class="btn btn-ghost" data-edit>Bearbeiten</button>${!state.activeId ? '<button class="btn btn-primary" data-repeat>Wiederholen</button>' : ''}`,
     onMount: (sh, close) => {
       sh.querySelector('[data-edit]').onclick = () => {
@@ -1108,7 +1707,8 @@ function openSessionDetail(s) {
         render();
         window.scrollTo(0, 0);
       };
-      sh.querySelector('[data-repeat]')?.addEventListener('click', () => { close(); startTraining(s); });
+      sh.querySelector('[data-repeat]')?.addEventListener('click', () => { close(); startTraining({ session: s }); });
+      sh.querySelector('[data-savetpl]').onclick = () => { close(); setTimeout(() => saveSessionAsTemplate(s), 50); };
     },
   });
 }
@@ -1393,7 +1993,7 @@ function restoreFlow(file) {
     if (data?.app !== 'kugelbuch') return toast('Diese Datei ist kein Kugelbuch-Backup.');
     openSheet({
       title: 'Backup wiederherstellen',
-      body: `<p class="muted">Backup vom ${new Date(data.exported).toLocaleString('de-DE')} mit ${data.sessions.length} Trainings und ${data.exercises.length} Übungen.</p>
+      body: `<p class="muted">Backup vom ${new Date(data.exported).toLocaleString('de-DE')} mit ${data.sessions.length} Trainings, ${data.exercises.length} Übungen${data.templates?.length ? ` und ${data.templates.length} Vorlagen` : ''}.</p>
         <div class="list" style="margin-top:14px">
           <button class="list-item" data-mode="merge"><div class="grow"><div class="t">Zusammenführen</div><div class="s">Fehlende Trainings ergänzen, vorhandene behalten</div></div>${ICON.chev}</button>
           <button class="list-item" data-mode="replace"><div class="grow"><div class="t" style="color:var(--danger)">Alles ersetzen</div><div class="s">Aktuelle Daten auf diesem Handy werden gelöscht</div></div>${ICON.chev}</button>
@@ -1407,7 +2007,7 @@ function restoreFlow(file) {
           const r = await importData(data, mode);
           applyTheme();
           render();
-          toast(`${r.sessions} Trainings wiederhergestellt`);
+          toast(`${r.sessions} Trainings${r.templates ? ` und ${r.templates} Vorlagen` : ''} wiederhergestellt`);
         } catch (err) { toast(err.message); }
       }),
     });
@@ -1428,10 +2028,11 @@ async function renderData() {
     ${backupNotice()}
     <div class="section-title"><h2>Sicherung</h2></div>
     <div class="panel stack">
-      <p class="small muted">Deine Trainings liegen nur auf diesem Handy. Speichere regelmäßig ein Backup und leg es z. B. in Google Drive ab. Mit der Datei kannst du alles wiederherstellen, auch auf einem neuen Handy.</p>
+      <p class="small muted">Deine Trainings und Vorlagen liegen nur auf diesem Handy. Speichere regelmäßig ein Backup und leg es z. B. in Google Drive ab. Mit der Datei kannst du alles wiederherstellen, auch auf einem neuen Handy.</p>
       <dl class="kv">
         <dt>Trainings</dt><dd>${done}</dd>
         <dt>Übungen</dt><dd>${state.exercises.length}</dd>
+        <dt>Vorlagen</dt><dd>${state.templates.length}</dd>
         <dt>Letztes Backup</dt><dd>${st.lastBackup ? `${fmtShort(st.lastBackup)} (${relDays(st.lastBackup)})` : 'noch keins'}</dd>
       </dl>
       <button class="btn btn-primary btn-block" data-d="backup">Backup speichern</button>
@@ -1587,6 +2188,8 @@ function registerSW() {
   }
   // leere, nicht weiter bearbeitete Nachträge aufräumen
   for (const s of [...state.sessions]) if (s.end && !s.entries.length) await deleteSession(s.id);
+  // angefangene, leere Vorlagen aufräumen
+  for (const t of [...state.templates]) if (!t.items.length) await deleteTemplate(t.id);
   applyTheme();
   if (state.activeId) sessionWakeOn();
   if (matchMedia('(display-mode: standalone)').matches && finishedSessions().length) requestPersist();

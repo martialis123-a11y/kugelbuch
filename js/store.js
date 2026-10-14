@@ -2,8 +2,9 @@
 import { uid } from './util.js';
 
 const DB_NAME = 'kugelbuch';
-const DB_VERSION = 1;
-const STORES = ['exercises', 'sessions', 'meta'];
+// Version 2: zusätzlicher Speicher für Trainingsvorlagen. Vorhandene Daten bleiben beim Upgrade unverändert.
+const DB_VERSION = 2;
+const STORES = ['exercises', 'sessions', 'meta', 'templates'];
 
 let db;
 
@@ -14,7 +15,12 @@ function openDB() {
       const d = req.result;
       for (const s of STORES) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' });
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const d = req.result;
+      // Falls eine neuere Version in einem anderen Tab startet: Verbindung freigeben
+      d.onversionchange = () => { d.close(); location.reload(); };
+      resolve(d);
+    };
     req.onerror = () => reject(req.error);
   });
 }
@@ -101,15 +107,18 @@ export const DEFAULT_SETTINGS = {
 export const state = {
   exercises: [],
   sessions: [],
+  templates: [],
   settings: { ...DEFAULT_SETTINGS },
   activeId: null,
 };
 
 export async function load() {
   db = await openDB();
-  const [ex, se, meta] = await Promise.all(STORES.map(getAll));
+  const [ex, se, meta, tp] = await Promise.all(STORES.map(getAll));
   state.exercises = ex.sort((a, b) => a.name.localeCompare(b.name, 'de'));
   state.sessions = se.sort((a, b) => b.start - a.start);
+  state.templates = tp;
+  sortTemplates();
   const settings = meta.find((m) => m.id === 'settings');
   state.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
   const active = meta.find((m) => m.id === 'active');
@@ -147,11 +156,21 @@ export async function saveExercise(ex) {
 export async function deleteExercise(id) {
   state.exercises = state.exercises.filter((e) => e.id !== id);
   await del('exercises', id);
+  // auch aus Vorlagen entfernen
+  for (const t of state.templates) {
+    if (t.items.some((it) => it.exId === id)) {
+      t.items = t.items.filter((it) => it.exId !== id);
+      await put('templates', t);
+    }
+  }
 }
 export function exerciseUsage(id) {
   let n = 0;
   for (const s of state.sessions) for (const e of s.entries) if (e.exId === id) n++;
   return n;
+}
+export function exerciseTemplates(id) {
+  return state.templates.filter((t) => t.items.some((it) => it.exId === id));
 }
 
 // Trainingseinheiten
@@ -171,6 +190,79 @@ export async function deleteSession(id) {
   state.sessions = state.sessions.filter((s) => s.id !== id);
   await del('sessions', id);
   if (state.activeId === id) await setActive(null);
+}
+
+// ---------- Trainingsvorlagen ----------
+// template: { id, name, created, updated, lastUsed, items: [item] }
+// item:     { id, exId, sets: [{ w, r, t }], timer: null | { mode: 'emom', interval, rounds, r, w, t } | { mode: 'countdown', total, w } }
+
+function sortTemplates() {
+  state.templates.sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.created - b.created);
+}
+export function templateById(id) {
+  return state.templates.find((t) => t.id === id);
+}
+export async function saveTemplate(t) {
+  if (!t.id) t.id = uid();
+  if (!t.created) t.created = Date.now();
+  if (t.order == null) t.order = Math.max(0, ...state.templates.map((x) => (x.order ?? 0) + 1));
+  t.updated = Date.now();
+  const i = state.templates.findIndex((x) => x.id === t.id);
+  if (i >= 0) state.templates[i] = t;
+  else state.templates.push(t);
+  sortTemplates();
+  await put('templates', t);
+  return t;
+}
+export async function deleteTemplate(id) {
+  state.templates = state.templates.filter((t) => t.id !== id);
+  await del('templates', id);
+}
+export async function moveTemplate(id, dir) {
+  const i = state.templates.findIndex((t) => t.id === id);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= state.templates.length) return;
+  const list = state.templates;
+  [list[i], list[j]] = [list[j], list[i]];
+  for (let k = 0; k < list.length; k++) {
+    if (list[k].order !== k) { list[k].order = k; await put('templates', list[k]); }
+  }
+}
+
+const cleanSet = (s) => ({ w: s.w ?? null, r: s.r ?? null, t: s.t ?? null });
+
+// Ein erledigter Übungseintrag wird zu einem Vorlagen-Baustein.
+// EMOM-Runden werden wieder zu einer EMOM-Vorgabe, ein AMRAP-Ergebnis zu einer Countdown-Vorgabe.
+export function entryToItem(entry) {
+  const emom = entry.sets.filter((s) => s.tag?.startsWith('EMOM'));
+  const amrap = entry.sets.filter((s) => s.tag === 'AMRAP');
+  const plain = entry.sets.filter((s) => !s.tag?.startsWith('EMOM') && s.tag !== 'AMRAP');
+  let timer = null;
+  if (emom.length) {
+    const f = emom[0];
+    timer = { mode: 'emom', interval: parseIntervalTag(f.tag) || 60, rounds: emom.length, r: f.r ?? null, w: f.w ?? null, t: f.t ?? null };
+  } else if (amrap.length) {
+    const f = amrap[0];
+    timer = { mode: 'countdown', total: f.t || 600, w: f.w ?? null };
+  }
+  return { id: uid(), exId: entry.exId, sets: plain.map(cleanSet), timer };
+}
+function parseIntervalTag(tag) {
+  const m = /(\d+):(\d{2})/.exec(tag || '');
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+export function sessionToItems(s) {
+  return s.entries.filter((e) => e.sets.length).map(entryToItem);
+}
+// Vorlagen-Baustein → Eintrag einer neuen Einheit mit geplanten (noch offenen) Sätzen
+export function itemToEntry(item) {
+  const e = { id: uid(), exId: item.exId, sets: [], plan: (item.sets || []).map((s) => ({ id: uid(), ...cleanSet(s) })) };
+  if (item.timer) e.timer = { ...item.timer };
+  return e;
+}
+// Vergleich ohne IDs: hat sich gegenüber der Vorlage etwas geändert?
+export function itemsSignature(items) {
+  return JSON.stringify(items.map((it) => [it.exId, (it.sets || []).map((s) => [s.w ?? null, s.r ?? null, s.t ?? null]), it.timer || null]));
 }
 
 // ---------- Kennzahlen ----------
@@ -220,10 +312,11 @@ export function lastPerformance(exId, excludeSessionId) {
 export function exportData() {
   return {
     app: 'kugelbuch',
-    format: 1,
+    format: 2,
     exported: new Date().toISOString(),
     exercises: state.exercises,
     sessions: state.sessions,
+    templates: state.templates,
     settings: { ...state.settings, lastBackup: undefined },
   };
 }
@@ -235,24 +328,31 @@ export async function importData(data, mode) {
   if (mode === 'replace') {
     await clear('exercises');
     await clear('sessions');
+    await clear('templates');
     state.exercises = [];
     state.sessions = [];
+    state.templates = [];
     await setActive(null);
   }
   for (const ex of data.exercises) await saveExercise(ex);
   for (const s of data.sessions) await saveSession(s);
+  // Backups im alten Format (1) haben noch keine Vorlagen
+  if (Array.isArray(data.templates)) {
+    for (const t of data.templates) if (t && Array.isArray(t.items)) await saveTemplate(t);
+  }
   if (data.settings && mode === 'replace') {
     const keep = state.settings.lastBackup;
     state.settings = { ...DEFAULT_SETTINGS, ...data.settings, id: 'settings', lastBackup: keep };
     await saveSettings();
   }
-  return { exercises: data.exercises.length, sessions: data.sessions.length };
+  return { exercises: data.exercises.length, sessions: data.sessions.length, templates: data.templates?.length || 0 };
 }
 
 export async function wipeAll() {
   for (const s of STORES) await clear(s);
   state.exercises = [];
   state.sessions = [];
+  state.templates = [];
   state.settings = { ...DEFAULT_SETTINGS };
   state.activeId = null;
 }
